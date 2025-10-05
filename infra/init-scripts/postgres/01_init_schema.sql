@@ -38,11 +38,28 @@ CREATE TABLE patents.claims (
     patent_id UUID NOT NULL REFERENCES patents.patents(id) ON DELETE CASCADE,
     claim_number INTEGER NOT NULL,
     claim_text TEXT NOT NULL,
-    
+
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    
+
     CONSTRAINT unique_patent_claim UNIQUE(patent_id, claim_number)
 );
 
 CREATE INDEX idx_claims_patent_id ON patents.claims(patent_id);
 CREATE INDEX idx_claims_text_trgm ON patents.claims USING gin(claim_text gin_trgm_ops);
+
+
+-- Citations table
+CREATE TABLE patents.citations (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    citing_patent_number VARCHAR(50) NOT NULL,
+    cited_patent_number VARCHAR(50) NOT NULL,
+    citation_type VARCHAR(20) NOT NULL, -- 'forward' or 'backward'
+
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT unique_citation UNIQUE(citing_patent_number, cited_patent_number)
+);
+
+CREATE INDEX idx_citations_citing ON patents.citations(citing_patent_number);
+CREATE INDEX idx_citations_cited ON patents.citations(cited_patent_number);
+CREATE INDEX idx_citations_type ON patents.citations(citation_type);
