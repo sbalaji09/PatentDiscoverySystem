@@ -3,19 +3,20 @@ from flask_restful import Resource, Api
 import sys
 from pathlib import Path
 
-# Add data-pipeline to path to import modules
 sys.path.insert(0, str(Path(__file__).parent.parent / "data-pipeline"))
 from postgres_loader import get_connection_string
 from ingestion import USPTOIngestionService
 from parser_service import PatentParserService
 from postgres_loader import PostgresLoader
+# pyscopg2 is used to connect to a PostgreSQL database
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
+# creates the basic Flask app with an API connection
 app = Flask(__name__)
 api = Api(app)
 
-# Endpoint 1: GET /api/patents - List patents with search/filter
+# GET /api/patents - queries the database to list patents, optionally filtering by a search query parameter matching titles or abstracts
 class PatentsList(Resource):
     def get(self):
         search = request.args.get('search', '').lower()
@@ -50,7 +51,7 @@ class PatentsList(Resource):
             if conn:
                 conn.close()
 
-# Endpoint 2: GET /api/patents/<patent_number> - Patent details
+# GET /api/patents/<patent_number> - fetches detailed data for a single patent including claims and citations
 class PatentDetail(Resource):
     def get(self, patent_number):
         conn = None
@@ -102,7 +103,7 @@ class PatentDetail(Resource):
             if conn:
                 conn.close()
 
-# Endpoint 3: POST /api/search - Search by user idea (fetches from USPTO)
+# POST /api/search - search USPTO by user idea (optionally stores results)
 class PatentSearch(Resource):
     def post(self):
         data = request.get_json()
@@ -151,7 +152,7 @@ class PatentSearch(Resource):
         except Exception as e:
             return jsonify({'error': str(e)}), 500
 
-# Endpoint 4: GET /api/stats - Database statistics
+# GET /api/stats - database statistics with top assignees
 class DatabaseStats(Resource):
     def get(self):
         conn = None
