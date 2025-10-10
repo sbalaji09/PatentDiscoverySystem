@@ -430,7 +430,7 @@ async def handle_json_rpc(request: Dict[str, Any]) -> Dict[str, Any]:
             return {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": [tool.dict() for tool in tools]
+                "result": [tool.model_dump() for tool in tools]
             }
         elif method == "mcp.callTool":
             tool_name = params.get("name")
@@ -453,7 +453,7 @@ async def handle_json_rpc(request: Dict[str, Any]) -> Dict[str, Any]:
             return {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": [item.dict() for item in result]
+                "result": [item.model_dump() for item in result]
             }
         else:
             raise ValueError(f"Unknown method: {method}")
@@ -471,46 +471,79 @@ async def handle_json_rpc(request: Dict[str, Any]) -> Dict[str, Any]:
         }
 
 async def handle_client(reader, writer):
-    """Handle client connections."""
+    """Handle client connections with HTTP protocol support."""
     addr = writer.get_extra_info('peername')
     logger.info(f"New connection from {addr}")
     
     try:
-        data = await reader.read(4096)
-        if not data:
+        # Read the request
+        request_data = await reader.read(4096)
+        if not request_data:
             return
+
+        # Parse HTTP request
+        try:
+            # Simple HTTP request parsing
+            headers, body = request_data.split(b'\r\n\r\n', 1) if b'\r\n\r\n' in request_data else (request_data, b'')
+            headers = headers.decode().split('\r\n')
             
-        request = json.loads(data.decode())
-        logger.debug(f"Received request: {json.dumps(request, indent=2)}")
-        
-        response = await handle_json_rpc(request)
-        logger.debug(f"Sending response: {json.dumps(response, indent=2)}")
-        
-        writer.write(json.dumps(response).encode() + b'\n')
+            # Only handle POST requests
+            if not headers[0].startswith('POST'):
+                response = "HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\n\r\nOnly POST method is allowed"
+                writer.write(response.encode())
+                await writer.drain()
+                return
+
+            # Parse JSON-RPC request
+            try:
+                request = json.loads(body)
+                logger.debug(f"Received request: {json.dumps(request, indent=2)}")
+                
+                # Process the JSON-RPC request
+                response_data = await handle_json_rpc(request)
+                response_json = json.dumps(response_data)
+                
+                # Send HTTP response
+                response = (
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: application/json\r\n"
+                    f"Content-Length: {len(response_json)}\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                    f"{response_json}"
+                )
+                
+            except json.JSONDecodeError as e:
+                error_msg = f"Invalid JSON: {str(e)}"
+                logger.error(error_msg)
+                response = (
+                    "HTTP/1.1 400 Bad Request\r\n"
+                    "Content-Type: application/json\r\n"
+                    "\r\n"
+                    '{"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}}'
+                )
+                
+        except Exception as e:
+            logger.error(f"Error processing request: {e}")
+            logger.error(traceback.format_exc())
+            response = (
+                "HTTP/1.1 500 Internal Server Error\r\n"
+                "Content-Type: application/json\r\n"
+                "\r\n"
+                '{"jsonrpc": "2.0", "error": {"code": -32603, "message": "Internal error"}}'
+            )
+            
+        writer.write(response.encode())
         await writer.drain()
         
-    except json.JSONDecodeError as e:
-        error_msg = f"Invalid JSON: {str(e)}"
-        logger.error(error_msg)
-        writer.write(json.dumps({
-            "jsonrpc": "2.0",
-            "id": None,
-            "error": {"code": -32700, "message": error_msg}
-        }).encode() + b'\n')
-        await writer.drain()
     except Exception as e:
-        error_msg = f"Error processing request: {str(e)}"
-        logger.error(error_msg)
+        logger.error(f"Unexpected error: {e}")
         logger.error(traceback.format_exc())
-        writer.write(json.dumps({
-            "jsonrpc": "2.0",
-            "id": None,
-            "error": {"code": -32000, "message": error_msg}
-        }).encode() + b'\n')
-        await writer.drain()
+        
     finally:
         writer.close()
         await writer.wait_closed()
+        logger.info(f"Connection closed: {addr}")
 
 async def main():
     """Run the MCP server using a TCP socket."""
@@ -534,7 +567,7 @@ async def main():
         # Start the server
         server = await asyncio.start_server(
             handle_client,
-            'localhost',
+            '127.0.0.1',
             8080,
             reuse_address=True
         )
