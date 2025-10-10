@@ -418,90 +418,6 @@ async def shutdown(server_task):
     print("MCP Server has been shut down.", file=sys.stderr)
 
 
-async def main():
-    """Run the MCP server using a TCP socket."""
-    stop_event = asyncio.Event()
-    shutdown_initiated = False
-
-    def _on_signal(_signum, _frame):
-        nonlocal shutdown_initiated
-        if shutdown_initiated:
-            print("\nForce shutdown...", file=sys.stderr, flush=True)
-            os._exit(0)
-        shutdown_initiated = True
-        print("\nShutdown signal received, cleaning up...", file=sys.stderr, flush=True)
-        asyncio.get_event_loop().call_soon_threadsafe(stop_event.set)
-
-    # Set up signal handlers
-    signal.signal(signal.SIGINT, _on_signal)
-    signal.signal(signal.SIGTERM, _on_signal)
-
-    try:
-        # Start the server
-        server = await asyncio.start_server(
-            handle_client,
-            'localhost',
-            8080,
-            reuse_address=True
-        )
-
-        addr = server.sockets[0].getsockname()
-        print(f'Serving on {addr}', file=sys.stderr, flush=True)
-
-        # Create a task for the server
-        server_task = asyncio.create_task(server.serve_forever())
-        # Create a task for the stop event
-        stop_task = asyncio.create_task(stop_event.wait())
-
-        try:
-            # Wait for either the server to be stopped or the stop event to be set
-            done, pending = await asyncio.wait(
-                [server_task, stop_task],
-                return_when=asyncio.FIRST_COMPLETED
-            )
-
-            # Cancel any pending tasks
-            for task in pending:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-
-        except asyncio.CancelledError:
-            # Handle cancellation
-            server_task.cancel()
-            stop_task.cancel()
-            raise
-
-        finally:
-            # Clean up
-            server.close()
-            await server.wait_closed()
-            print("Server stopped", file=sys.stderr, flush=True)
-
-    except Exception as e:
-        print(f"Server error: {e}", file=sys.stderr, flush=True)
-        traceback.print_exc(file=sys.stderr)
-        raise
-
-def run_server():
-    """Entrypoint for running the MCP server."""
-    exit_code = 0
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        # Shouldn't happen because we install signal handlers, but just in case
-        print("\nKeyboard interrupt received.", file=sys.stderr, flush=True)
-    except Exception as e:
-        print(f"Fatal error: {e}", file=sys.stderr, flush=True)
-        exit_code = 1
-
-    print("MCP Server process exiting cleanly.", file=sys.stderr, flush=True)
-    # Force exit because asyncio.run() may not fully cleanup stdio streams
-    os._exit(exit_code)
-
-
 async def handle_json_rpc(request: Dict[str, Any]) -> Dict[str, Any]:
     """Handle JSON-RPC 2.0 requests."""
     try:
@@ -628,21 +544,25 @@ async def main():
 
         async with server:
             server_task = asyncio.create_task(server.serve_forever())
-            
+            stop_task = asyncio.create_task(stop_event.wait())
+
             # Wait for server to be closed or stop_event to be set
             done, pending = await asyncio.wait(
-                [stop_event.wait()],
+                [server_task, stop_task],
                 return_when=asyncio.FIRST_COMPLETED
             )
 
             # Cleanup
             server.close()
             await server.wait_closed()
-            server_task.cancel()
-            try:
-                await server_task
-            except asyncio.CancelledError:
-                pass
+
+            # Cancel all pending tasks
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
         print("Server stopped", file=sys.stderr, flush=True)
         
@@ -653,13 +573,17 @@ async def main():
 
 def run_server():
     """Run the MCP server."""
+    exit_code = 0
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nServer stopped by user", file=sys.stderr, flush=True)
     except Exception as e:
         print(f"Fatal error: {e}", file=sys.stderr, flush=True)
-        sys.exit(1)
+        exit_code = 1
+
+    print("MCP Server process exiting cleanly.", file=sys.stderr, flush=True)
+    os._exit(exit_code)
 
 if __name__ == "__main__":
     run_server()
