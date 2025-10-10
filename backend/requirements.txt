@@ -2,4 +2,4 @@ flask
 flask-restful
 psycopg2-binary
 anthropic
-mcp
+mcp>=0.1.0
