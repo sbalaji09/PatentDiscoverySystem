@@ -5,11 +5,23 @@ Provides tools for patent ingestion, search, and analysis.
 
 import asyncio
 import contextlib
+import json
+import logging
 import os
+import signal
 import sys
+import traceback
 from datetime import datetime
 from pathlib import Path
-import signal
+from typing import Any, Dict, List, Optional
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stderr)]
+)
+logger = logging.getLogger("mcp-server")
 
 # Add parent directory to path to import data-pipeline modules
 sys.path.insert(0, str(Path(__file__).parent.parent / "data-pipeline"))
@@ -407,85 +419,71 @@ async def shutdown(server_task):
 
 
 async def main():
-    """Run the MCP server using stdin/stdout streams, with robust shutdown."""
+    """Run the MCP server using a TCP socket."""
     stop_event = asyncio.Event()
     shutdown_initiated = False
 
     def _on_signal(_signum, _frame):
         nonlocal shutdown_initiated
         if shutdown_initiated:
-            # Second signal - force exit
             print("\nForce shutdown...", file=sys.stderr, flush=True)
             os._exit(0)
         shutdown_initiated = True
         print("\nShutdown signal received, cleaning up...", file=sys.stderr, flush=True)
-        # Schedule stop_event.set() in the event loop
         asyncio.get_event_loop().call_soon_threadsafe(stop_event.set)
 
-    # Use signal.signal instead of loop.add_signal_handler for better macOS compatibility
+    # Set up signal handlers
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
 
     try:
-        async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
-            print("MCP Server starting...", file=sys.stderr, flush=True)
+        # Start the server
+        server = await asyncio.start_server(
+            handle_client,
+            'localhost',
+            8080,
+            reuse_address=True
+        )
 
-            server_task = asyncio.create_task(
-                server.run(
-                    read_stream,
-                    write_stream,
-                    InitializationOptions(
-                        server_name="patent-discovery-server",
-                        server_version="1.0.0",
-                        capabilities=server.get_capabilities(
-                            notification_options=NotificationOptions(),
-                            experimental_capabilities={},
-                        ),
-                    ),
-                ),
-                name="mcp-server.run",
+        addr = server.sockets[0].getsockname()
+        print(f'Serving on {addr}', file=sys.stderr, flush=True)
+
+        # Create a task for the server
+        server_task = asyncio.create_task(server.serve_forever())
+        # Create a task for the stop event
+        stop_task = asyncio.create_task(stop_event.wait())
+
+        try:
+            # Wait for either the server to be stopped or the stop event to be set
+            done, pending = await asyncio.wait(
+                [server_task, stop_task],
+                return_when=asyncio.FIRST_COMPLETED
             )
 
-            try:
-                # Wait for either server completion or shutdown signal
-                await asyncio.wait(
-                    [server_task, asyncio.create_task(stop_event.wait())],
-                    return_when=asyncio.FIRST_COMPLETED
-                )
+            # Cancel any pending tasks
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
-                if stop_event.is_set():
-                    print("\nMCP Server received shutdown signal...", file=sys.stderr, flush=True)
+        except asyncio.CancelledError:
+            # Handle cancellation
+            server_task.cancel()
+            stop_task.cancel()
+            raise
 
-                    # Cancel server task
-                    server_task.cancel()
-
-                    # Close stdio streams to unblock any readers
-                    with contextlib.suppress(Exception):
-                        if hasattr(read_stream, "close"):
-                            read_stream.close()
-                        if hasattr(write_stream, "close"):
-                            write_stream.close()
-
-                    # Wait for server task with timeout
-                    try:
-                        await asyncio.wait_for(server_task, timeout=1.0)
-                    except (asyncio.TimeoutError, asyncio.CancelledError):
-                        print("Server task cancelled.", file=sys.stderr, flush=True)
-
-            except Exception as e:
-                print(f"Error during server operation: {e}", file=sys.stderr, flush=True)
-            finally:
-                # Cancel all remaining tasks before exiting context manager
-                pending_tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
-                if pending_tasks:
-                    for task in pending_tasks:
-                        task.cancel()
-                    await asyncio.gather(*pending_tasks, return_exceptions=True)
+        finally:
+            # Clean up
+            server.close()
+            await server.wait_closed()
+            print("Server stopped", file=sys.stderr, flush=True)
 
     except Exception as e:
-        print(f"Error in stdio_server context: {e}", file=sys.stderr, flush=True)
-    finally:
-        print("MCP Server has been stopped.", file=sys.stderr, flush=True)
+        print(f"Server error: {e}", file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
+        raise
 
 def run_server():
     """Entrypoint for running the MCP server."""
@@ -503,6 +501,165 @@ def run_server():
     # Force exit because asyncio.run() may not fully cleanup stdio streams
     os._exit(exit_code)
 
+
+async def handle_json_rpc(request: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle JSON-RPC 2.0 requests."""
+    try:
+        method = request.get("method", "")
+        params = request.get("params", {})
+        request_id = request.get("id")
+        
+        if method == "mcp.listTools":
+            tools = await handle_list_tools()
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": [tool.dict() for tool in tools]
+            }
+        elif method == "mcp.callTool":
+            tool_name = params.get("name")
+            arguments = params.get("arguments", {})
+            
+            # Call the appropriate tool handler
+            if tool_name == "extract_keywords_from_idea":
+                result = await extract_keywords_handler(arguments)
+            elif tool_name == "fetch_patents_by_idea":
+                result = await fetch_patents_by_idea_handler(arguments)
+            elif tool_name == "ingest_and_store_patents":
+                result = await ingest_and_store_patents_handler(arguments)
+            elif tool_name == "fetch_patents_by_assignee":
+                result = await fetch_patents_by_assignee_handler(arguments)
+            elif tool_name == "get_database_stats":
+                result = await get_database_stats_handler(arguments)
+            else:
+                raise ValueError(f"Unknown tool: {tool_name}")
+            
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": [item.dict() for item in result]
+            }
+        else:
+            raise ValueError(f"Unknown method: {method}")
+            
+    except Exception as e:
+        logger.error(f"Error handling request: {str(e)}")
+        logger.error(traceback.format_exc())
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {
+                "code": -32603,
+                "message": str(e)
+            }
+        }
+
+async def handle_client(reader, writer):
+    """Handle client connections."""
+    addr = writer.get_extra_info('peername')
+    logger.info(f"New connection from {addr}")
+    
+    try:
+        data = await reader.read(4096)
+        if not data:
+            return
+            
+        request = json.loads(data.decode())
+        logger.debug(f"Received request: {json.dumps(request, indent=2)}")
+        
+        response = await handle_json_rpc(request)
+        logger.debug(f"Sending response: {json.dumps(response, indent=2)}")
+        
+        writer.write(json.dumps(response).encode() + b'\n')
+        await writer.drain()
+        
+    except json.JSONDecodeError as e:
+        error_msg = f"Invalid JSON: {str(e)}"
+        logger.error(error_msg)
+        writer.write(json.dumps({
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32700, "message": error_msg}
+        }).encode() + b'\n')
+        await writer.drain()
+    except Exception as e:
+        error_msg = f"Error processing request: {str(e)}"
+        logger.error(error_msg)
+        logger.error(traceback.format_exc())
+        writer.write(json.dumps({
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32000, "message": error_msg}
+        }).encode() + b'\n')
+        await writer.drain()
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+async def main():
+    """Run the MCP server using a TCP socket."""
+    stop_event = asyncio.Event()
+    shutdown_initiated = False
+
+    def _on_signal(_signum, _frame):
+        nonlocal shutdown_initiated
+        if shutdown_initiated:
+            print("\nForce shutdown...", file=sys.stderr, flush=True)
+            os._exit(0)
+        shutdown_initiated = True
+        print("\nShutdown signal received, cleaning up...", file=sys.stderr, flush=True)
+        asyncio.get_event_loop().call_soon_threadsafe(stop_event.set)
+
+    # Set up signal handlers
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+
+    try:
+        # Start the server
+        server = await asyncio.start_server(
+            handle_client,
+            'localhost',
+            8080,
+            reuse_address=True
+        )
+
+        addr = server.sockets[0].getsockname()
+        print(f'Serving on {addr}', file=sys.stderr, flush=True)
+
+        async with server:
+            server_task = asyncio.create_task(server.serve_forever())
+            
+            # Wait for server to be closed or stop_event to be set
+            done, pending = await asyncio.wait(
+                [stop_event.wait()],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+
+            # Cleanup
+            server.close()
+            await server.wait_closed()
+            server_task.cancel()
+            try:
+                await server_task
+            except asyncio.CancelledError:
+                pass
+
+        print("Server stopped", file=sys.stderr, flush=True)
+        
+    except Exception as e:
+        print(f"Server error: {e}", file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
+        raise
+
+def run_server():
+    """Run the MCP server."""
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nServer stopped by user", file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"Fatal error: {e}", file=sys.stderr, flush=True)
+        sys.exit(1)
 
 if __name__ == "__main__":
     run_server()
