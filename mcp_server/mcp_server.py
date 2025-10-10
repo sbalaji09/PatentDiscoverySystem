@@ -382,20 +382,41 @@ async def extract_keywords_handler(arguments: dict | None) -> list[types.TextCon
 
 async def main():
     """Run the MCP server using stdin/stdout streams."""
-    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream,
-            InitializationOptions(
-                server_name="patent-discovery-server",
-                server_version="1.0.0",
-                capabilities=server.get_capabilities(
-                    notification_options=NotificationOptions(),
-                    experimental_capabilities={},
+    try:
+        async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
+            print("MCP Server starting...", file=sys.stderr)
+            await server.run(
+                read_stream,
+                write_stream,
+                InitializationOptions(
+                    server_name="patent-discovery-server",
+                    server_version="1.0.0",
+                    capabilities=server.get_capabilities(
+                        notification_options=NotificationOptions(),
+                        experimental_capabilities={},
+                    ),
                 ),
-            ),
-        )
+            )
+    except asyncio.CancelledError:
+        print("\nMCP Server shutting down gracefully...", file=sys.stderr)
+    except Exception as e:
+        print(f"Error in MCP Server: {str(e)}", file=sys.stderr)
+        raise
+    finally:
+        print("MCP Server stopped.", file=sys.stderr)
+
+
+def run_server():
+    """Run the MCP server with proper signal handling."""
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nReceived shutdown signal. Exiting...", file=sys.stderr)
+        sys.exit(0)
+    except Exception as e:
+        print(f"Fatal error: {str(e)}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    run_server()
